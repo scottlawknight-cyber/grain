@@ -1,18 +1,36 @@
 """
-بوت الحجز التلقائي - نظام حجز الحبوب العراقي v2026.07.01
-- نظام حسابات متعددة (كل حساب = كوكيز + توكن)
-- زر إرسال مباشر + محرك مراقبة بتأخير عشوائي
-- إلغاء SSL + لا إغلاق تلقائي للمتصفح
+بوت الحجز التلقائي الذكي - نظام حجز الحبوب العراقي
+الإصدار: 2026.06.30
+- إلغاء SSL Verify لحل مشكلة الشهادة
+- زر سحب التوكن من المتصفح (يدوي)
+- قوائم جاهزة + خيار جلب من السيرفر
 """
-import sys, os, json, time, random, sqlite3, logging, urllib3, requests
+import sys
+import json
+import time
+import sqlite3
+import logging
+import urllib3
+import requests
 from bs4 import BeautifulSoup
 import undetected_chromedriver as uc
 from webdriver_manager.chrome import ChromeDriverManager
-from PyQt6.QtWidgets import *
+
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout,
+    QHBoxLayout, QLabel, QLineEdit, QPushButton,
+    QTableWidget, QTableWidgetItem, QTextEdit, QTabWidget,
+    QFormLayout, QMessageBox, QHeaderView, QCheckBox,
+    QComboBox, QGroupBox, QProgressBar
+)
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
 
+# إلغاء تحذيرات SSL
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# ==========================================
+# إعدادات الروابط
+# ==========================================
 BASE_URL = "https://hajz.grainboardiq.com"
 LOGIN_URL = f"{BASE_URL}/Identity/Account/DriverLogin?returnUrl=%2F"
 BOOKING_PAGE_URL = f"{BASE_URL}/Reservation/Create"
@@ -22,532 +40,908 @@ SLOTS_API_URL = f"{BASE_URL}/Reservation/GetReservationDayOptions"
 DIRECTORATES_API = f"{BASE_URL}/api/LocationApi/GetDirectoratesByGovernorate"
 CENTERS_API = f"{BASE_URL}/api/LocationApi/GetMarketingCentersByDirectorate"
 SILOS_API = f"{BASE_URL}/api/LocationApi/GetSilosByMarketingCenter"
-ACCOUNTS_DIR = "accounts"
 
+# ==========================================
+# القوائم الجاهزة (من الموقع مباشرة)
+# ==========================================
 GOVERNORATES = [
-    {"id": "12", "name": "اربيل"}, {"id": "11", "name": "السليمانية"},
-    {"id": "13", "name": "حلبجة"}, {"id": "14", "name": "دهوك"},
-    {"id": "16", "name": "صلاح الدين"}, {"id": "15", "name": "كركوك"},
-    {"id": "2", "name": "نينوى"},
+    {"id": "12", "name": "اربيل", "outer": "false"},
+    {"id": "11", "name": "السليمانية", "outer": "false"},
+    {"id": "13", "name": "حلبجة", "outer": "false"},
+    {"id": "14", "name": "دهوك", "outer": "false"},
+    {"id": "16", "name": "صلاح الدين", "outer": "false"},
+    {"id": "15", "name": "كركوك", "outer": "true"},
+    {"id": "2", "name": "نينوى", "outer": "true"},
 ]
 
-# === إدارة الحسابات ===
-def get_accounts():
-    os.makedirs(ACCOUNTS_DIR, exist_ok=True)
-    return sorted([d for d in os.listdir(ACCOUNTS_DIR) if os.path.isdir(os.path.join(ACCOUNTS_DIR, d))])
 
-def account_path(name):
-    p = os.path.join(ACCOUNTS_DIR, name)
-    os.makedirs(p, exist_ok=True)
-    return p
 
-def save_cookies(name, cookies):
-    with open(os.path.join(account_path(name), 'cookies.json'), 'w', encoding='utf-8') as f:
-        json.dump(cookies, f, ensure_ascii=False, indent=2)
-
-def save_token(name, token):
-    with open(os.path.join(account_path(name), 'token.txt'), 'w', encoding='utf-8') as f:
-        f.write(token)
-
-def load_token(name):
-    try:
-        with open(os.path.join(ACCOUNTS_DIR, name, 'token.txt'), 'r') as f:
-            t = f.read().strip()
-            return t if len(t) > 20 else None
-    except: return None
-
-def make_session(name):
+# ==========================================
+# دالة إنشاء جلسة مع إلغاء SSL
+# ==========================================
+def create_session():
+    """إنشاء جلسة requests مع إلغاء التحقق من SSL"""
     s = requests.Session()
-    s.verify = False
-    s.headers.update({"User-Agent": "Mozilla/5.0 Chrome/146.0.0.0", "Accept-Language": "ar",
-                      "X-Requested-With": "XMLHttpRequest", "Referer": BOOKING_PAGE_URL})
-    try:
-        with open(os.path.join(ACCOUNTS_DIR, name, 'cookies.json'), 'r') as f:
-            for c in json.load(f):
-                s.cookies.set(c['name'], c['value'], domain=c.get('domain', ''))
-    except: pass
+    s.verify = False  # إلغاء SSL Verify
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 Chrome/146.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "ar",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": BOOKING_PAGE_URL,
+    })
     return s
 
-def search_farmer(session, name, center_id, silo_id, is_outer):
-    for q in [name] + (name.split()[:1] if ' ' in name else []):
-        try:
-            r = session.get(SEARCH_API_URL, params={"marketingCenterId": center_id, "siloId": silo_id,
-                "hasOtherSiloApproval": "false", "isOuterPlanReservation": is_outer, "q": q, "limit": 50}, timeout=15)
-            if r.status_code == 200:
-                results = r.json().get("results", [])
-                if results:
-                    for x in results:
-                        if name in x.get("text", ""): return x.get("id"), x.get("text", "")
-                    return results[0].get("id"), results[0].get("text", "")
-        except: pass
-    return None, None
 
+def load_cookies_to_session(session):
+    """تحميل الكوكيز من الملف إلى الجلسة"""
+    try:
+        with open('cookies.json', 'r', encoding='utf-8') as f:
+            cookies = json.load(f)
+            for c in cookies:
+                session.cookies.set(c['name'], c['value'],
+                                    domain=c.get('domain', ''))
+        return True
+    except FileNotFoundError:
+        return False
+
+
+# ==========================================
+# Logging Handler
+# ==========================================
 class SignallingLogHandler(logging.Handler):
-    def __init__(self, sig): super().__init__(); self.sig = sig
-    def emit(self, r): self.sig.emit(self.format(r))
-
-# === BrowserWorker ===
-class BrowserWorker(QThread):
-    log = pyqtSignal(str)
-    done = pyqtSignal(bool)
-    def __init__(self, mode, account):
-        super().__init__(); self.mode = mode; self.account = account; self.driver = None
-    def run(self):
-        opts = uc.ChromeOptions()
-        opts.add_argument("--disable-blink-features=AutomationControlled")
-        opts.add_argument("--disable-popup-blocking")
-        opts.add_argument("--ignore-certificate-errors")
-        try:
-            self.log.emit(f"🔍 [{self.account}] تشغيل المتصفح...")
-            dp = ChromeDriverManager().install()
-            drv = uc.Chrome(driver_executable_path=dp, options=opts)
-            if self.mode == "token": self._token(drv)
-            else: self._login(drv)
-        except Exception as e:
-            self.log.emit(f"❌ {e}"); self.done.emit(False)
-
-    def _login(self, drv):
-        self.log.emit(f"🌐 [{self.account}] سجل الدخول عبر تلجرام.")
-        drv.get(LOGIN_URL)
-        PS = "(function(){var o=window.open;window.open=function(u,n,f){if(u&&(u.indexOf('oauth')!==-1||u.indexOf('telegram')!==-1)){window.location.href=u;return window}return o.call(window,u,'_blank','')};})();"
-        try: drv.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": PS})
-        except: pass
-        drv.execute_script(PS)
-        self.log.emit(f"⏳ [{self.account}] بانتظار تسجيل الدخول...")
-        end = time.time() + 300
-        ok = False
-        while time.time() < end:
-            try:
-                for h in drv.window_handles:
-                    try: drv.switch_to.window(h)
-                    except: continue
-                    for c in drv.get_cookies():
-                        if c['name'] == '.AspNetCore.Identity.Application' and len(c.get('value','')) > 50:
-                            ok = True; break
-                    if ok: break
-                if ok: break
-            except: pass
-            time.sleep(2)
-        if ok:
-            time.sleep(3)
-            cks = []
-            for h in drv.window_handles:
-                try: drv.switch_to.window(h); cks.extend(drv.get_cookies())
-                except: pass
-            seen = set()
-            uniq = [c for c in cks if c['name'] not in seen and not seen.add(c['name'])]
-            save_cookies(self.account, uniq)
-            self.log.emit(f"✅ [{self.account}] كوكيز ({len(uniq)}) محفوظة!")
-        else:
-            self.log.emit(f"⚠️ [{self.account}] انتهت المهلة.")
-        self.log.emit("💡 اضغط 'إغلاق المتصفح' عند الانتهاء.")
-        self.driver = drv; self.done.emit(ok)
-
-    def _token(self, drv):
-        self.log.emit(f"🔑 [{self.account}] سحب التوكن...")
-        drv.get(BASE_URL); time.sleep(2)
-        try:
-            for c in json.load(open(os.path.join(ACCOUNTS_DIR, self.account, 'cookies.json'))):
-                try: drv.add_cookie({'name':c['name'],'value':c['value'],'domain':c.get('domain','.grainboardiq.com'),'path':c.get('path','/')})
-                except: pass
-        except: pass
-        drv.get(BOOKING_PAGE_URL); time.sleep(3)
-        soup = BeautifulSoup(drv.page_source, 'html.parser')
-        inp = soup.find('input', {'name': '__RequestVerificationToken'})
-        if inp:
-            save_token(self.account, inp['value'])
-            self.log.emit(f"✅ [{self.account}] توكن محفوظ! ({inp['value'][:30]}...)")
-        else:
-            self.log.emit(f"❌ [{self.account}] فشل سحب التوكن")
-        self.log.emit("💡 اضغط 'إغلاق المتصفح'.")
-        self.driver = drv; self.done.emit(bool(inp))
-
-# === DirectBookingWorker ===
-class DirectBookingWorker(QThread):
-    log = pyqtSignal(str)
-    done = pyqtSignal(bool, str)
-    def __init__(self, account, farmer, silo, center, outer):
+    def __init__(self, signal):
         super().__init__()
-        self.account=account; self.farmer=farmer; self.silo=silo; self.center=center; self.outer=outer
-    def run(self):
-        s = make_session(self.account)
-        token = load_token(self.account)
-        if not token:
-            self.log.emit(f"❌ [{self.account}] لا توكن!"); self.done.emit(False,""); return
-        self.log.emit(f"🔍 [{self.account}] بحث ({self.farmer})...")
-        fid, fn = search_farmer(s, self.farmer, self.center, self.silo, self.outer)
-        if not fid:
-            self.log.emit(f"⚠️ لم يُعثر على ({self.farmer})"); self.done.emit(False,""); return
-        self.log.emit(f"📤 [{self.account}] إرسال حجز {fn}...")
-        payload = {"__RequestVerificationToken": token, "FarmerId": fid, "SiloId": self.silo,
-                   "HasOtherSiloApproval":"false","IsOuterPlanReservation":self.outer,
-                   "SelectedMarketingReservedDayNum":"","HasVehicleInfo":"false",
-                   "VehicleLetter":"","VehicleNumber":"","VehicleGovernorate":"",
-                   "VehicleNumberGovernorate":"","PlateType":"","DriverName":"","VehicleType":""}
-        try:
-            r = s.post(BOOKING_POST_URL, data=payload, timeout=20)
-            if r.status_code == 200:
-                j = r.json()
-                if j.get("success"):
-                    self.log.emit(f"🎉 [{self.account}] حجز ناجح! ({j.get('id','')})")
-                    self.done.emit(True, str(j.get('id',''))); return
-                self.log.emit(f"❌ {j.get('message','خطأ')}"); self.done.emit(False, j.get('message','')); return
-            self.log.emit(f"❌ HTTP {r.status_code}"); self.done.emit(False,"")
-        except Exception as e:
-            self.log.emit(f"❌ {e}"); self.done.emit(False,"")
+        self.signal = signal
 
-# === MonitoringWorker (رانج عشوائي) ===
-class MonitoringWorker(QThread):
-    log = pyqtSignal(str)
-    def __init__(self, db, dmin, dmax):
-        super().__init__(); self.db=db; self.running=True; self.dmin=dmin; self.dmax=dmax
-    def stop(self): self.running = False
+    def emit(self, record):
+        self.signal.emit(self.format(record))
+
+
+
+# ==========================================
+# تسجيل الدخول عبر تلجرام + سحب التوكن من المتصفح
+# ==========================================
+class BrowserWorker(QThread):
+    log_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(bool)
+
+    def __init__(self, mode="login"):
+        """mode: 'login' لتسجيل الدخول, 'token' لسحب التوكن"""
+        super().__init__()
+        self.mode = mode
+        self.driver = None  # مرجع المتصفح للإغلاق اليدوي
+
     def run(self):
-        self.log.emit(f"🚀 المحرك يعمل (تأخير {self.dmin}-{self.dmax}ث)")
+        options = uc.ChromeOptions()
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument("--disable-popup-blocking")
+        options.add_argument("--ignore-certificate-errors")
+        options.add_argument("--ignore-ssl-errors")
+        options.add_experimental_option("prefs", {
+            "profile.default_content_setting_values.popups": 1,
+        })
+
+        try:
+            self.log_signal.emit("🔍 جاري تشغيل المتصفح...")
+            driver_path = ChromeDriverManager().install()
+            driver = uc.Chrome(driver_executable_path=driver_path, options=options)
+
+            if self.mode == "token":
+                self._extract_token(driver)
+            else:
+                self._do_login(driver)
+
+        except Exception as e:
+            self.log_signal.emit(f"❌ خطأ: {str(e)}")
+            self.finished_signal.emit(False)
+
+    def _do_login(self, driver):
+        """تسجيل الدخول عبر تلجرام"""
+        self.log_signal.emit("🌐 تم فتح المتصفح. سجل الدخول عبر تلجرام.")
+        driver.get(LOGIN_URL)
+
+        # حقن سكريبت لمنع المنبثقات الخارجية
+        POPUP_SCRIPT = """
+        (function() {
+            var orig = window.open;
+            window.open = function(url, name, features) {
+                if (url && (url.indexOf('oauth') !== -1 ||
+                    url.indexOf('telegram') !== -1)) {
+                    window.location.href = url;
+                    return window;
+                }
+                return orig.call(window, url, '_blank', '');
+            };
+        })();
+        """
+        try:
+            driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument",
+                                   {"source": POPUP_SCRIPT})
+        except Exception:
+            pass
+        driver.execute_script(POPUP_SCRIPT)
+
+        self.log_signal.emit("⏳ بانتظار إتمام تسجيل الدخول... (لا تغلق المتصفح)")
+
+        # انتظار كوكي المصادقة
+        max_wait = 300
+        start = time.time()
+        confirmed = False
+
+        while (time.time() - start) < max_wait:
+            try:
+                handles = driver.window_handles
+                if not handles:
+                    time.sleep(2)
+                    continue
+                for handle in handles:
+                    try:
+                        driver.switch_to.window(handle)
+                    except Exception:
+                        continue
+                    for c in driver.get_cookies():
+                        if (c['name'] == '.AspNetCore.Identity.Application'
+                                and len(c.get('value', '')) > 50):
+                            confirmed = True
+                            break
+                    if confirmed:
+                        break
+                if confirmed:
+                    break
+            except Exception:
+                pass
+            time.sleep(2)
+
+        if confirmed:
+            time.sleep(3)
+            all_cookies = []
+            for handle in driver.window_handles:
+                try:
+                    driver.switch_to.window(handle)
+                    all_cookies.extend(driver.get_cookies())
+                except Exception:
+                    pass
+
+            seen = set()
+            unique = []
+            for c in all_cookies:
+                if c['name'] not in seen:
+                    seen.add(c['name'])
+                    unique.append(c)
+
+            with open('cookies.json', 'w', encoding='utf-8') as f:
+                json.dump(unique, f, ensure_ascii=False, indent=2)
+
+            self.log_signal.emit(f"✅ تم استخراج الكوكيز بنجاح! العدد: {len(unique)}")
+            self.log_signal.emit("💡 المتصفح مفتوح - اضغط 'إغلاق المتصفح' عند الانتهاء.")
+            # لا يُغلق المتصفح تلقائياً - ينتظر الزر
+            self.driver = driver
+            self.finished_signal.emit(True)
+        else:
+            self.log_signal.emit("⚠️ انتهت المهلة. حاول مرة أخرى.")
+            self.driver = driver  # يبقى مفتوحاً للمحاولة مرة أخرى
+            self.finished_signal.emit(False)
+        # لا إغلاق تلقائي!
+
+    def _extract_token(self, driver):
+        """سحب التوكن من المتصفح عبر فتح صفحة الحجز"""
+        self.log_signal.emit("🔑 جاري فتح صفحة الحجز لسحب التوكن...")
+
+        # تحميل الكوكيز المحفوظة للمتصفح
+        driver.get(BASE_URL)
+        time.sleep(2)
+
+        try:
+            with open('cookies.json', 'r', encoding='utf-8') as f:
+                cookies = json.load(f)
+                for c in cookies:
+                    cookie_dict = {
+                        'name': c['name'],
+                        'value': c['value'],
+                        'domain': c.get('domain', '.grainboardiq.com'),
+                    }
+                    if 'path' in c:
+                        cookie_dict['path'] = c['path']
+                    try:
+                        driver.add_cookie(cookie_dict)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        driver.get(BOOKING_PAGE_URL)
+        time.sleep(3)
+
+        # استخراج التوكن من الصفحة
+        page_source = driver.page_source
+        soup = BeautifulSoup(page_source, 'html.parser')
+        token_input = soup.find('input', {'name': '__RequestVerificationToken'})
+
+        if token_input:
+            token = token_input['value']
+            with open('token.txt', 'w', encoding='utf-8') as f:
+                f.write(token)
+            self.log_signal.emit(f"✅ تم سحب التوكن بنجاح! (محفوظ في token.txt)")
+            self.log_signal.emit(f"🔑 التوكن: {token[:50]}...")
+            self.log_signal.emit("💡 المتصفح مفتوح - اضغط 'إغلاق المتصفح' عند الانتهاء.")
+            self.driver = driver
+            self.finished_signal.emit(True)
+        else:
+            self.log_signal.emit("❌ فشل سحب التوكن - تأكد من صلاحية الجلسة")
+            self.driver = driver
+            self.finished_signal.emit(False)
+        # لا إغلاق تلقائي!
+
+
+
+# ==========================================
+# جلب البيانات من الموقع (مع إلغاء SSL)
+# ==========================================
+class DataFetchWorker(QThread):
+    result_signal = pyqtSignal(str, list)
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, fetch_type, params=None):
+        super().__init__()
+        self.fetch_type = fetch_type
+        self.params = params or {}
+        self.session = create_session()
+        load_cookies_to_session(self.session)
+
+    def run(self):
+        try:
+            if self.fetch_type == "governorates":
+                res = self.session.get(BOOKING_PAGE_URL, timeout=200)
+                if res.status_code == 200:
+                    soup = BeautifulSoup(res.text, 'html.parser')
+                    select = soup.find('select', {'id': 'modalGovernorateId'})
+                    if select:
+                        options = []
+                        for opt in select.find_all('option'):
+                            val = opt.get('value', '')
+                            if val:
+                                options.append({
+                                    'id': val,
+                                    'name': opt.text.strip(),
+                                    'outer': opt.get('data-enable-outer-plan', 'false')
+                                })
+                        self.result_signal.emit("governorates", options)
+                        return
+                self.error_signal.emit("فشل جلب المحافظات من السيرفر")
+
+            elif self.fetch_type == "directorates":
+                res = self.session.get(DIRECTORATES_API,
+                    params={"governorateId": self.params.get("governorateId")}, timeout=150)
+                if res.status_code == 200:
+                    self.result_signal.emit("directorates", res.json())
+                else:
+                    self.error_signal.emit("فشل جلب المديريات")
+
+            elif self.fetch_type == "centers":
+                res = self.session.get(CENTERS_API,
+                    params={"directorateId": self.params.get("directorateId")}, timeout=150)
+                if res.status_code == 200:
+                    self.result_signal.emit("centers", res.json())
+                else:
+                    self.error_signal.emit("فشل جلب الشعب")
+
+            elif self.fetch_type == "silos":
+                res = self.session.get(SILOS_API,
+                    params={"marketingCenterId": self.params.get("marketingCenterId")}, timeout=150)
+                if res.status_code == 200:
+                    self.result_signal.emit("silos", res.json())
+                else:
+                    self.error_signal.emit("فشل جلب السايلوات")
+
+            elif self.fetch_type == "farmers":
+                params = {
+                    "marketingCenterId": self.params.get("marketingCenterId"),
+                    "siloId": self.params.get("siloId"),
+                    "hasOtherSiloApproval": "false",
+                    "isOuterPlanReservation": self.params.get("isOuter", "false"),
+                    "q": self.params.get("query", "ا"),
+                    "limit": 50
+                }
+                res = self.session.get(SEARCH_API_URL, params=params, timeout=200)
+                if res.status_code == 200:
+                    self.result_signal.emit("farmers", res.json().get("results", []))
+                else:
+                    self.error_signal.emit("فشل جلب الفلاحين")
+
+        except Exception as e:
+            self.error_signal.emit(f"خطأ اتصال: {str(e)}")
+
+
+
+# ==========================================
+# محرك المراقبة والحجز (مع إلغاء SSL + توكن من ملف)
+# ==========================================
+class MonitoringWorker(QThread):
+    log_signal = pyqtSignal(str)
+
+    def __init__(self, db_name='alghanem_transactions.db'):
+        super().__init__()
+        self.db_name = db_name
+        self.running = True
+        self.session = create_session()
+
+    def stop(self):
+        self.running = False
+
+    def search_farmer(self, name, center_id, silo_id, is_outer):
+        parts = name.strip().split()
+        queries = [name]
+        if len(parts) > 1:
+            queries.append(parts[0])
+            queries.append(" ".join(parts[:2]))
+
+        for q in queries:
+            try:
+                params = {
+                    "marketingCenterId": center_id,
+                    "siloId": silo_id,
+                    "hasOtherSiloApproval": "false",
+                    "isOuterPlanReservation": is_outer,
+                    "q": q, "limit": 50
+                }
+                res = self.session.get(SEARCH_API_URL, params=params, timeout=200)
+                if res.status_code == 200:
+                    results = res.json().get("results", [])
+                    if results:
+                        for r in results:
+                            if name in r.get("text", ""):
+                                return r.get("id"), r.get("text", "")
+                        return results[0].get("id"), results[0].get("text", "")
+            except Exception:
+                continue
+        return None, None
+
+    def get_token(self):
+        """سحب التوكن حصراً من الملف المحفوظ (المستخرج يدوياً بالمتصفح)"""
+        try:
+            with open('token.txt', 'r', encoding='utf-8') as f:
+                token = f.read().strip()
+                if token and len(token) > 20:
+                    return token
+        except FileNotFoundError:
+            pass
+        # لا يوجد fallback - التوكن يُسحب فقط عبر الزر
+        return None
+
+    def submit_booking(self, token, farmer_id, silo_id, is_outer):
+        payload = {
+            "__RequestVerificationToken": token,
+            "FarmerId": farmer_id, "SiloId": silo_id,
+            "HasOtherSiloApproval": "false",
+            "IsOuterPlanReservation": is_outer,
+            "SelectedMarketingReservedDayNum": "",
+            "HasVehicleInfo": "false",
+            "VehicleLetter": "", "VehicleNumber": "",
+            "VehicleGovernorate": "", "VehicleNumberGovernorate": "",
+            "PlateType": "", "DriverName": "", "VehicleType": ""
+        }
+        res = self.session.post(BOOKING_POST_URL, data=payload, timeout=200)
+        if res.status_code == 200:
+            try:
+                result = res.json()
+                if result.get("success"):
+                    return True, result.get("id", "")
+                return False, result.get("message", "خطأ")
+            except Exception:
+                if "Print" in res.url or "MyReservations" in res.url:
+                    return True, ""
+        return False, f"HTTP {res.status_code}"
+
+    def run(self):
+        if not load_cookies_to_session(self.session):
+            self.log_signal.emit("❌ ملف الكوكيز غير موجود!")
+            return
+
+        # التحقق من الجلسة
+        try:
+            res = self.session.get(BOOKING_PAGE_URL, timeout=200, allow_redirects=False)
+            if res.status_code == 302 and "login" in res.headers.get("Location", "").lower():
+                self.log_signal.emit("❌ الجلسة منتهية! جدد الكوكيز.")
+                return
+        except Exception as e:
+            self.log_signal.emit(f"❌ خطأ اتصال: {e}")
+            return
+
+        self.log_signal.emit("🚀 المحرك يعمل (24/7)... ✅")
+
         while self.running:
             try:
-                conn = sqlite3.connect(self.db)
-                txs = conn.cursor().execute("SELECT id,client_name,silo_id,center_id,is_outer,account FROM transactions WHERE status='pending'").fetchall()
+                conn = sqlite3.connect(self.db_name)
+                txs = conn.cursor().execute(
+                    "SELECT id, client_name, silo_id, center_id, is_outer "
+                    "FROM transactions WHERE status = 'pending'").fetchall()
                 conn.close()
+
                 if not txs:
-                    d=random.randint(20,40); self.log.emit(f"🔄 لا معاملات ({d}ث)"); time.sleep(d); continue
+                    self.log_signal.emit("🔄 لا معاملات. فحص بعد 30 ثانية...")
+                    time.sleep(30)
+                    continue
+
                 for tx in txs:
                     if not self.running: break
-                    tid,name,silo,center,outer,acct = tx
-                    if not acct: self.log.emit(f"⚠️ #{tid} بدون حساب!"); continue
-                    token = load_token(acct)
-                    if not token: self.log.emit(f"❌ [{acct}] لا توكن!"); continue
-                    s = make_session(acct)
-                    self.log.emit(f"🔍 [{acct}] فحص ({silo}) - {name}")
+                    tx_id, name, silo_id, center_id, is_outer = tx
+                    self.log_signal.emit(f"🔍 فحص ({silo_id}) - {name}...")
+
                     try:
-                        sr = s.get(SLOTS_API_URL, params={"siloId":silo,"isOuterPlanReservation":outer}, timeout=10)
-                    except Exception as e: self.log.emit(f"⚠️ {e}"); continue
-                    if sr.status_code==401: self.log.emit(f"❌ [{acct}] جلسة منتهية!"); continue
-                    days = sr.json() if sr.status_code==200 else []
+                        sr = self.session.get(SLOTS_API_URL,
+                            params={"siloId": silo_id, "isOuterPlanReservation": is_outer},
+                            timeout=300)
+                    except Exception as e:
+                        self.log_signal.emit(f"⚠️ اتصال: {e}")
+                        continue
+
+                    if sr.status_code == 401:
+                        self.log_signal.emit("❌ الجلسة انتهت!")
+                        self.running = False; break
+
+                    days = sr.json() if sr.status_code == 200 else []
                     if not any(d.get("isSelectable") for d in days):
-                        self.log.emit(f"⏳ [{acct}] لا حصص"); continue
-                    self.log.emit(f"🎯 [{acct}] حصة! بحث ({name})...")
-                    fid,fn = search_farmer(s, name, center, silo, outer)
-                    if not fid: self.log.emit(f"⚠️ ({name}) غير موجود"); continue
-                    self.log.emit(f"📤 [{acct}] حجز {fn}...")
-                    payload = {"__RequestVerificationToken":token,"FarmerId":fid,"SiloId":silo,
-                               "HasOtherSiloApproval":"false","IsOuterPlanReservation":outer,
-                               "SelectedMarketingReservedDayNum":"","HasVehicleInfo":"false",
-                               "VehicleLetter":"","VehicleNumber":"","VehicleGovernorate":"",
-                               "VehicleNumberGovernorate":"","PlateType":"","DriverName":"","VehicleType":""}
-                    try:
-                        r = s.post(BOOKING_POST_URL, data=payload, timeout=20)
-                        if r.status_code==200:
-                            j=r.json()
-                            if j.get("success"):
-                                self.log.emit(f"🎉 [{acct}] حجز ناجح: {fn}")
-                                conn=sqlite3.connect(self.db); conn.cursor().execute("UPDATE transactions SET status='booked' WHERE id=?",(tid,)); conn.commit(); conn.close()
-                            else: self.log.emit(f"❌ {j.get('message','')}")
-                        else: self.log.emit(f"❌ HTTP {r.status_code}")
-                    except Exception as e: self.log.emit(f"❌ {e}")
-                    d=random.randint(self.dmin,self.dmax); time.sleep(d)
-                if self.running: time.sleep(random.randint(self.dmin,self.dmax))
-            except Exception as e: self.log.emit(f"⚠️ {e}"); time.sleep(10)
+                        self.log_signal.emit(f"⏳ لا حصص ({silo_id})")
+                        continue
 
-# === DataFetchWorker ===
-class DataFetchWorker(QThread):
-    result = pyqtSignal(str, list)
-    error = pyqtSignal(str)
-    def __init__(self, ftype, params=None, account=""):
-        super().__init__(); self.ftype=ftype; self.params=params or {}; self.account=account
-    def run(self):
-        s = make_session(self.account) if self.account else requests.Session()
-        s.verify = False
-        try:
-            if self.ftype=="governorates":
-                r=s.get(BOOKING_PAGE_URL,timeout=15)
-                if r.status_code==200:
-                    soup=BeautifulSoup(r.text,'html.parser')
-                    sel=soup.find('select',{'id':'modalGovernorateId'})
-                    if sel:
-                        self.result.emit("governorates",[{'id':o.get('value',''),'name':o.text.strip()} for o in sel.find_all('option') if o.get('value','')]); return
-                self.error.emit("فشل جلب المحافظات")
-            elif self.ftype=="directorates":
-                r=s.get(DIRECTORATES_API,params={"governorateId":self.params.get("gid")},timeout=10)
-                self.result.emit("directorates",r.json()) if r.status_code==200 else self.error.emit("فشل")
-            elif self.ftype=="centers":
-                r=s.get(CENTERS_API,params={"directorateId":self.params.get("did")},timeout=10)
-                self.result.emit("centers",r.json()) if r.status_code==200 else self.error.emit("فشل")
-            elif self.ftype=="silos":
-                r=s.get(SILOS_API,params={"marketingCenterId":self.params.get("cid")},timeout=10)
-                self.result.emit("silos",r.json()) if r.status_code==200 else self.error.emit("فشل")
-            elif self.ftype=="farmers":
-                p={"marketingCenterId":self.params.get("cid"),"siloId":self.params.get("sid"),
-                   "hasOtherSiloApproval":"false","isOuterPlanReservation":self.params.get("outer","false"),
-                   "q":self.params.get("q","ا"),"limit":50}
-                r=s.get(SEARCH_API_URL,params=p,timeout=15)
-                self.result.emit("farmers",r.json().get("results",[])) if r.status_code==200 else self.error.emit("فشل")
-        except Exception as e: self.error.emit(str(e))
+                    self.log_signal.emit(f"🎯 حصة متاحة! سحب ({name})...")
+                    fid, fname = self.search_farmer(name, center_id, silo_id, is_outer)
+                    if not fid:
+                        self.log_signal.emit(f"⚠️ ({name}) غير موجود باللائحة!")
+                        continue
 
-# === الواجهة الرسومية ===
-class App(QMainWindow):
+                    self.log_signal.emit(f"✅ {fname} (ID:{fid})")
+                    token = self.get_token()
+                    if not token:
+                        self.log_signal.emit("❌ لا توكن! اسحبه من المتصفح.")
+                        continue
+
+                    self.log_signal.emit("📤 إرسال الحجز...")
+                    ok, detail = self.submit_booking(token, fid, silo_id, is_outer)
+
+                    if ok:
+                        self.log_signal.emit(f"🎉 تم الحجز: {fname} ({detail})")
+                        conn = sqlite3.connect(self.db_name)
+                        conn.cursor().execute(
+                            "UPDATE transactions SET status='booked' WHERE id=?", (tx_id,))
+                        conn.commit(); conn.close()
+                    else:
+                        self.log_signal.emit(f"❌ فشل: {detail}")
+                        # إذا فشل بسبب التوكن، حذف الملف لإجبار السحب اليدوي
+                        if "token" in detail.lower() or "verification" in detail.lower():
+                            try:
+                                import os
+                                os.remove('token.txt')
+                            except Exception:
+                                pass
+                            self.log_signal.emit("⚠️ التوكن منتهي! اسحب توكن جديد من المتصفح.")
+
+                if self.running: time.sleep(10)
+            except Exception as e:
+                self.log_signal.emit(f"⚠️ {str(e)}")
+                time.sleep(15)
+
+
+
+# ==========================================
+# الواجهة الرسومية
+# ==========================================
+class AlGhanemBotGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.db = 'bot.db'; self._init_db()
-        self.setWindowTitle("بوت الحجز v2026"); self.resize(1050, 800)
-        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        self.browser_thread = None; self.monitor_thread = None; self.fetch_threads = []
-        central = QWidget(); self.setCentralWidget(central)
-        lay = QVBoxLayout(central)
-        self.tabs = QTabWidget(); lay.addWidget(self.tabs)
-        self.tab1 = QWidget(); self.tab2 = QWidget(); self.tab3 = QWidget()
-        self.tabs.addTab(self.tab1, "🎮 المحرك"); self.tabs.addTab(self.tab2, "➕ إضافة"); self.tabs.addTab(self.tab3, "📋 المعاملات")
-        self._ui_engine(); self._ui_add(); self._ui_list()
-        handler = SignallingLogHandler(self.log.append)
-        handler.setFormatter(logging.Formatter('%(asctime)s %(message)s', '%H:%M:%S'))
+        self.db_name = 'alghanem_transactions.db'
+        self._init_db()
+        self.init_ui()
+        handler = SignallingLogHandler(self.log_viewer.append)
+        handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s', '%H:%M:%S'))
         logging.getLogger().addHandler(handler)
+        self.monitoring_thread = None
+        self.browser_thread = None
+        self.fetch_threads = []
 
     def _init_db(self):
-        with sqlite3.connect(self.db) as c:
-            c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='transactions'")
-            if c.fetchone():
-                cols = [x[1] for x in c.execute("PRAGMA table_info(transactions)").fetchall()]
-                if 'account' not in cols: c.execute('DROP TABLE transactions')
-            c.execute('''CREATE TABLE IF NOT EXISTS transactions(
-                id INTEGER PRIMARY KEY AUTOINCREMENT, client_name TEXT, silo_id TEXT,
-                center_id TEXT, is_outer TEXT DEFAULT 'false', account TEXT, status TEXT DEFAULT 'pending')''')
+        with sqlite3.connect(self.db_name) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='transactions'")
+            if cur.fetchone():
+                cur.execute("PRAGMA table_info(transactions)")
+                cols = [c[1] for c in cur.fetchall()]
+                if 'center_id' not in cols:
+                    cur.execute('DROP TABLE transactions')
+            cur.execute('''CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_name TEXT NOT NULL,
+                silo_id TEXT NOT NULL,
+                center_id TEXT NOT NULL,
+                is_outer TEXT DEFAULT 'false',
+                status TEXT DEFAULT 'pending'
+            )''')
+            conn.commit()
 
-    def _ui_engine(self):
-        L = QVBoxLayout(self.tab1)
-        # حساب
-        g1 = QGroupBox("👤 الحساب النشط"); gl = QHBoxLayout(g1)
-        self.cmb_acct = QComboBox(); self._refresh_accounts()
-        btn_new = QPushButton("➕ حساب جديد"); btn_new.clicked.connect(self._new_account)
-        gl.addWidget(QLabel("الحساب:")); gl.addWidget(self.cmb_acct); gl.addWidget(btn_new)
-        L.addWidget(g1)
-        # أزرار
-        r1 = QHBoxLayout()
-        self.btn_login = QPushButton("🔐 تسجيل الدخول"); self.btn_login.setStyleSheet("background:#2b579a;color:white;font-weight:bold;padding:10px;")
-        self.btn_login.clicked.connect(lambda: self._browser("login"))
-        self.btn_token = QPushButton("🔑 سحب التوكن"); self.btn_token.setStyleSheet("background:#6f42c1;color:white;font-weight:bold;padding:10px;")
-        self.btn_token.clicked.connect(lambda: self._browser("token"))
-        self.btn_close = QPushButton("❌ إغلاق المتصفح"); self.btn_close.setStyleSheet("background:#dc3545;color:white;font-weight:bold;padding:10px;")
-        self.btn_close.clicked.connect(self._close_browser); self.btn_close.setEnabled(False)
-        r1.addWidget(self.btn_login); r1.addWidget(self.btn_token); r1.addWidget(self.btn_close)
-        L.addLayout(r1)
-        # محرك + رانج
-        g2 = QGroupBox("⚙️ المحرك (رانج تأخير عشوائي)"); g2l = QHBoxLayout(g2)
-        g2l.addWidget(QLabel("من:")); self.spin_min = QSpinBox(); self.spin_min.setRange(1,120); self.spin_min.setValue(5)
-        g2l.addWidget(self.spin_min); g2l.addWidget(QLabel("إلى:"))
-        self.spin_max = QSpinBox(); self.spin_max.setRange(1,300); self.spin_max.setValue(20)
-        g2l.addWidget(self.spin_max); g2l.addWidget(QLabel("ثانية"))
-        self.btn_start = QPushButton("▶️ تشغيل"); self.btn_start.setStyleSheet("background:#107c41;color:white;font-weight:bold;padding:10px;")
-        self.btn_start.clicked.connect(self._start)
-        self.btn_stop = QPushButton("⏹️ إيقاف"); self.btn_stop.setStyleSheet("background:#a80000;color:white;font-weight:bold;padding:10px;")
-        self.btn_stop.setEnabled(False); self.btn_stop.clicked.connect(self._stop)
-        g2l.addWidget(self.btn_start); g2l.addWidget(self.btn_stop)
-        L.addWidget(g2)
-        # السجل
-        self.log = QTextEdit(); self.log.setReadOnly(True)
-        self.log.setStyleSheet("background:#1e1e1e;color:#00ff00;font-family:Consolas;font-size:11pt;")
-        L.addWidget(self.log)
+    def init_ui(self):
+        self.setWindowTitle("مكتب الغانم - بوت الحجز v2026")
+        self.resize(1000, 780)
+        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
 
-    def _ui_add(self):
-        L = QVBoxLayout(self.tab2)
-        # الحساب
-        ar = QHBoxLayout(); ar.addWidget(QLabel("الحساب:")); self.cmb_acct2 = QComboBox(); self._refresh_accounts2()
-        ar.addWidget(self.cmb_acct2); L.addLayout(ar)
-        # الموقع
-        g = QGroupBox("📍 الموقع"); gl = QFormLayout(g)
-        br = QHBoxLayout()
-        b1 = QPushButton("📋 جاهزة"); b1.clicked.connect(self._local_govs)
-        b2 = QPushButton("🌐 سيرفر"); b2.clicked.connect(self._server_govs)
-        br.addWidget(b1); br.addWidget(b2); gl.addRow("مصدر:", br)
-        self.cmb_gov = QComboBox(); self.cmb_gov.currentIndexChanged.connect(self._gov_ch)
-        self.cmb_dir = QComboBox(); self.cmb_dir.setEnabled(False); self.cmb_dir.currentIndexChanged.connect(self._dir_ch)
-        self.cmb_ctr = QComboBox(); self.cmb_ctr.setEnabled(False); self.cmb_ctr.currentIndexChanged.connect(self._ctr_ch)
-        self.cmb_silo = QComboBox(); self.cmb_silo.setEnabled(False)
-        self.chk_outer = QCheckBox("خارج الخطة")
-        gl.addRow("المحافظة:", self.cmb_gov); gl.addRow("المديرية:", self.cmb_dir)
-        gl.addRow("الشعبة:", self.cmb_ctr); gl.addRow("السايلو:", self.cmb_silo)
-        gl.addRow("", self.chk_outer); L.addWidget(g)
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+
+        self.tab_engine = QWidget()
+        self.tab_add = QWidget()
+        self.tab_list = QWidget()
+        self.tabs.addTab(self.tab_engine, "🎮 المحرك")
+        self.tabs.addTab(self.tab_add, "➕ إضافة معاملة")
+        self.tabs.addTab(self.tab_list, "📋 المعاملات")
+
+        self._setup_engine_tab()
+        self._setup_add_tab()
+        self._setup_list_tab()
+
+    def _setup_engine_tab(self):
+        layout = QVBoxLayout(self.tab_engine)
+
+        # صف 1: تسجيل الدخول وسحب التوكن
+        row1 = QHBoxLayout()
+        self.btn_session = QPushButton("🔐 تسجيل الدخول (تلجرام)")
+        self.btn_session.setStyleSheet("background:#2b579a;color:white;font-weight:bold;padding:12px;border-radius:5px;")
+        self.btn_session.clicked.connect(self._run_login)
+
+        self.btn_token = QPushButton("🔑 سحب التوكن من المتصفح")
+        self.btn_token.setStyleSheet("background:#6f42c1;color:white;font-weight:bold;padding:12px;border-radius:5px;")
+        self.btn_token.clicked.connect(self._run_token_extract)
+
+        self.btn_close_browser = QPushButton("❌ إغلاق المتصفح")
+        self.btn_close_browser.setStyleSheet("background:#dc3545;color:white;font-weight:bold;padding:12px;border-radius:5px;")
+        self.btn_close_browser.clicked.connect(self._close_browser)
+        self.btn_close_browser.setEnabled(False)
+
+        row1.addWidget(self.btn_session)
+        row1.addWidget(self.btn_token)
+        row1.addWidget(self.btn_close_browser)
+        layout.addLayout(row1)
+
+        # صف 2: تشغيل/إيقاف المحرك
+        row2 = QHBoxLayout()
+        self.btn_start = QPushButton("▶️ تشغيل المحرك")
+        self.btn_start.setStyleSheet("background:#107c41;color:white;font-weight:bold;padding:12px;border-radius:5px;")
+        self.btn_start.clicked.connect(self._start_engine)
+
+        self.btn_stop = QPushButton("⏹️ إيقاف")
+        self.btn_stop.setStyleSheet("background:#a80000;color:white;font-weight:bold;padding:12px;border-radius:5px;")
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self._stop_engine)
+
+        row2.addWidget(self.btn_start)
+        row2.addWidget(self.btn_stop)
+        layout.addLayout(row2)
+
+        layout.addWidget(QLabel("📺 سجل العمليات:"))
+        self.log_viewer = QTextEdit()
+        self.log_viewer.setReadOnly(True)
+        self.log_viewer.setStyleSheet("background:#1e1e1e;color:#00ff00;font-family:Consolas;font-size:11pt;")
+        layout.addWidget(self.log_viewer)
+
+
+    def _setup_add_tab(self):
+        layout = QVBoxLayout(self.tab_add)
+
+        # القوائم الجاهزة + جلب من السيرفر
+        loc_group = QGroupBox("📍 اختيار الموقع (قوائم جاهزة + جلب من السيرفر)")
+        loc_layout = QFormLayout(loc_group)
+
+        # زر جلب من السيرفر
+        btn_row = QHBoxLayout()
+        self.btn_load_server = QPushButton("🌐 جلب من السيرفر")
+        self.btn_load_server.setStyleSheet("background:#0078d4;color:white;font-weight:bold;padding:8px;border-radius:4px;")
+        self.btn_load_server.clicked.connect(self._load_from_server)
+        self.btn_load_local = QPushButton("📋 استخدام القوائم الجاهزة")
+        self.btn_load_local.setStyleSheet("background:#6c757d;color:white;font-weight:bold;padding:8px;border-radius:4px;")
+        self.btn_load_local.clicked.connect(self._load_local_govs)
+        btn_row.addWidget(self.btn_load_server)
+        btn_row.addWidget(self.btn_load_local)
+        loc_layout.addRow(QLabel("المصدر:"), btn_row)
+
+        # القوائم المنسدلة
+        self.cmb_gov = QComboBox()
+        self.cmb_gov.addItem("-- اختر المحافظة --", "")
+        self.cmb_gov.currentIndexChanged.connect(self._on_gov_changed)
+
+        self.cmb_dir = QComboBox()
+        self.cmb_dir.addItem("-- اختر المديرية --", "")
+        self.cmb_dir.setEnabled(False)
+        self.cmb_dir.currentIndexChanged.connect(self._on_dir_changed)
+
+        self.cmb_center = QComboBox()
+        self.cmb_center.addItem("-- اختر الشعبة --", "")
+        self.cmb_center.setEnabled(False)
+        self.cmb_center.currentIndexChanged.connect(self._on_center_changed)
+
+        self.cmb_silo = QComboBox()
+        self.cmb_silo.addItem("-- اختر السايلو --", "")
+        self.cmb_silo.setEnabled(False)
+
+        self.chk_outer = QCheckBox("حجز خارج الخطة")
+
+        loc_layout.addRow("المحافظة:", self.cmb_gov)
+        loc_layout.addRow("المديرية:", self.cmb_dir)
+        loc_layout.addRow("الشعبة:", self.cmb_center)
+        loc_layout.addRow("السايلو:", self.cmb_silo)
+        loc_layout.addRow("", self.chk_outer)
+        layout.addWidget(loc_group)
+
         # الفلاح
-        fg = QGroupBox("👤 الفلاح"); fl = QVBoxLayout(fg)
-        sr = QHBoxLayout(); self.inp_f = QLineEdit(); self.inp_f.setPlaceholderText("اكتب جزءاً من الاسم...")
-        bs = QPushButton("🔍"); bs.clicked.connect(self._search_f); sr.addWidget(self.inp_f); sr.addWidget(bs)
-        fl.addLayout(sr); self.cmb_f = QComboBox(); self.cmb_f.setEnabled(False); fl.addWidget(self.cmb_f)
-        L.addWidget(fg)
-        # أزرار
-        btns = QHBoxLayout()
-        self.btn_save = QPushButton("💾 حفظ للمراقبة"); self.btn_save.setStyleSheet("background:#0d6efd;color:white;font-weight:bold;padding:12px;font-size:11pt;")
-        self.btn_save.clicked.connect(self._save)
-        self.btn_direct = QPushButton("🚀 إرسال مباشر الآن"); self.btn_direct.setStyleSheet("background:#e65100;color:white;font-weight:bold;padding:12px;font-size:11pt;")
-        self.btn_direct.clicked.connect(self._direct_send)
-        btns.addWidget(self.btn_save); btns.addWidget(self.btn_direct)
-        L.addLayout(btns)
-        self.prog = QProgressBar(); self.prog.setVisible(False); L.addWidget(self.prog)
-        self._local_govs()
+        farmer_group = QGroupBox("👤 الفلاح (بحث من لائحة الموقع)")
+        farmer_layout = QVBoxLayout(farmer_group)
+        search_row = QHBoxLayout()
+        self.input_farmer = QLineEdit()
+        self.input_farmer.setPlaceholderText("اكتب جزءاً من الاسم...")
+        self.btn_search = QPushButton("🔍 بحث")
+        self.btn_search.setStyleSheet("background:#107c41;color:white;font-weight:bold;padding:8px;border-radius:4px;")
+        self.btn_search.clicked.connect(self._search_farmers)
+        search_row.addWidget(self.input_farmer)
+        search_row.addWidget(self.btn_search)
+        farmer_layout.addLayout(search_row)
 
-    def _ui_list(self):
-        L = QVBoxLayout(self.tab3)
-        self.tbl = QTableWidget(); self.tbl.setColumnCount(7)
-        self.tbl.setHorizontalHeaderLabels(["ID","الفلاح","السايلو","الشعبة","خارج","الحساب","الحالة"])
-        self.tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        L.addWidget(self.tbl)
-        r = QHBoxLayout()
-        QPushButton("🔄", clicked=self._rtbl).also = r.addWidget(QPushButton("🔄 تحديث", clicked=self._rtbl))
-        r.addWidget(QPushButton("🗑️ حذف", clicked=self._del))
-        L.addLayout(r); self._rtbl()
+        self.cmb_farmer = QComboBox()
+        self.cmb_farmer.addItem("-- نتائج البحث --", "")
+        self.cmb_farmer.setEnabled(False)
+        farmer_layout.addWidget(self.cmb_farmer)
+        layout.addWidget(farmer_group)
 
-    # === أحداث ===
-    def _refresh_accounts(self):
-        self.cmb_acct.clear(); self.cmb_acct.addItems(get_accounts() or ["(لا حسابات)"])
-    def _refresh_accounts2(self):
-        self.cmb_acct2.clear(); self.cmb_acct2.addItems(get_accounts() or ["(لا حسابات)"])
-    def _new_account(self):
-        name, ok = QInputDialog.getText(self, "حساب جديد", "اسم الحساب:")
-        if ok and name.strip():
-            account_path(name.strip())
-            self._refresh_accounts(); self._refresh_accounts2()
-            self.log.append(f"✅ حساب ({name.strip()}) تم إنشاؤه")
+        # حفظ
+        self.btn_save = QPushButton("💾 حفظ المعاملة")
+        self.btn_save.setStyleSheet("background:#0d6efd;color:white;font-weight:bold;padding:14px;border-radius:6px;font-size:12pt;")
+        self.btn_save.clicked.connect(self._save_transaction)
+        layout.addWidget(self.btn_save)
 
-    def _browser(self, mode):
-        acct = self.cmb_acct.currentText()
-        if not acct or acct == "(لا حسابات)":
-            QMessageBox.warning(self, "!", "أنشئ حساباً أولاً"); return
-        self.btn_login.setEnabled(False); self.btn_token.setEnabled(False)
-        self.browser_thread = BrowserWorker(mode, acct)
-        self.browser_thread.log.connect(self.log.append)
-        self.browser_thread.done.connect(self._browser_done)
+        self.progress = QProgressBar()
+        self.progress.setVisible(False)
+        layout.addWidget(self.progress)
+
+        # تحميل القوائم الجاهزة تلقائياً
+        self._load_local_govs()
+
+
+    def _setup_list_tab(self):
+        layout = QVBoxLayout(self.tab_list)
+        self.table = QTableWidget()
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels(["ID", "الفلاح", "السايلو", "الشعبة", "خارج الخطة", "الحالة"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.table)
+        row = QHBoxLayout()
+        btn_r = QPushButton("🔄 تحديث")
+        btn_r.clicked.connect(self._refresh_table)
+        btn_d = QPushButton("🗑️ حذف")
+        btn_d.clicked.connect(self._delete_selected)
+        row.addWidget(btn_r); row.addWidget(btn_d)
+        layout.addLayout(row)
+        self._refresh_table()
+
+    # ==========================================
+    # القوائم الجاهزة المحلية
+    # ==========================================
+    def _load_local_govs(self):
+        """تحميل المحافظات من القائمة الجاهزة"""
+        self.cmb_gov.clear()
+        self.cmb_gov.addItem("-- اختر المحافظة --", "")
+        for g in GOVERNORATES:
+            self.cmb_gov.addItem(g['name'], g['id'])
+        self.log_viewer.append(f"📋 تم تحميل {len(GOVERNORATES)} محافظة (جاهزة)")
+
+    def _load_from_server(self):
+        """جلب المحافظات من السيرفر"""
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 0)
+        w = DataFetchWorker("governorates")
+        w.result_signal.connect(self._on_data)
+        w.error_signal.connect(self._on_error)
+        w.finished.connect(lambda: self.progress.setVisible(False))
+        self.fetch_threads.append(w)
+        w.start()
+
+    def _on_gov_changed(self, idx):
+        gov_id = self.cmb_gov.currentData()
+        self.cmb_dir.clear()
+        self.cmb_dir.addItem("-- اختر المديرية --", "")
+        self.cmb_center.clear()
+        self.cmb_center.addItem("-- اختر الشعبة --", "")
+        self.cmb_silo.clear()
+        self.cmb_silo.addItem("-- اختر السايلو --", "")
+        self.cmb_dir.setEnabled(False)
+        self.cmb_center.setEnabled(False)
+        self.cmb_silo.setEnabled(False)
+        if gov_id:
+            self.progress.setVisible(True); self.progress.setRange(0, 0)
+            w = DataFetchWorker("directorates", {"governorateId": gov_id})
+            w.result_signal.connect(self._on_data)
+            w.error_signal.connect(self._on_error)
+            w.finished.connect(lambda: self.progress.setVisible(False))
+            self.fetch_threads.append(w); w.start()
+
+    def _on_dir_changed(self, idx):
+        dir_id = self.cmb_dir.currentData()
+        self.cmb_center.clear()
+        self.cmb_center.addItem("-- اختر الشعبة --", "")
+        self.cmb_silo.clear()
+        self.cmb_silo.addItem("-- اختر السايلو --", "")
+        self.cmb_center.setEnabled(False)
+        self.cmb_silo.setEnabled(False)
+        if dir_id:
+            self.progress.setVisible(True); self.progress.setRange(0, 0)
+            w = DataFetchWorker("centers", {"directorateId": dir_id})
+            w.result_signal.connect(self._on_data)
+            w.error_signal.connect(self._on_error)
+            w.finished.connect(lambda: self.progress.setVisible(False))
+            self.fetch_threads.append(w); w.start()
+
+    def _on_center_changed(self, idx):
+        center_id = self.cmb_center.currentData()
+        self.cmb_silo.clear()
+        self.cmb_silo.addItem("-- اختر السايلو --", "")
+        self.cmb_silo.setEnabled(False)
+        if center_id:
+            self.progress.setVisible(True); self.progress.setRange(0, 0)
+            w = DataFetchWorker("silos", {"marketingCenterId": center_id})
+            w.result_signal.connect(self._on_data)
+            w.error_signal.connect(self._on_error)
+            w.finished.connect(lambda: self.progress.setVisible(False))
+            self.fetch_threads.append(w); w.start()
+
+    def _search_farmers(self):
+        q = self.input_farmer.text().strip()
+        center_id = self.cmb_center.currentData()
+        silo_id = self.cmb_silo.currentData()
+        if not q:
+            QMessageBox.warning(self, "!", "اكتب حرفاً على الأقل"); return
+        if not center_id or not silo_id:
+            QMessageBox.warning(self, "!", "اختر الشعبة والسايلو أولاً"); return
+        is_outer = "true" if self.chk_outer.isChecked() else "false"
+        self.progress.setVisible(True); self.progress.setRange(0, 0)
+        w = DataFetchWorker("farmers", {
+            "marketingCenterId": center_id, "siloId": silo_id,
+            "isOuter": is_outer, "query": q
+        })
+        w.result_signal.connect(self._on_data)
+        w.error_signal.connect(self._on_error)
+        w.finished.connect(lambda: self.progress.setVisible(False))
+        self.fetch_threads.append(w); w.start()
+
+    def _on_data(self, dtype, data):
+        if dtype == "governorates":
+            self.cmb_gov.clear()
+            self.cmb_gov.addItem("-- اختر المحافظة --", "")
+            for item in data:
+                self.cmb_gov.addItem(item['name'], item['id'])
+            self.log_viewer.append(f"🌐 {len(data)} محافظة من السيرفر")
+        elif dtype == "directorates":
+            self.cmb_dir.clear()
+            self.cmb_dir.addItem("-- اختر المديرية --", "")
+            for item in data:
+                self.cmb_dir.addItem(item.get('name',''), str(item.get('id','')))
+            self.cmb_dir.setEnabled(True)
+        elif dtype == "centers":
+            self.cmb_center.clear()
+            self.cmb_center.addItem("-- اختر الشعبة --", "")
+            for item in data:
+                self.cmb_center.addItem(item.get('name',''), str(item.get('id','')))
+            self.cmb_center.setEnabled(True)
+        elif dtype == "silos":
+            self.cmb_silo.clear()
+            self.cmb_silo.addItem("-- اختر السايلو --", "")
+            for item in data:
+                self.cmb_silo.addItem(item.get('name',''), str(item.get('id','')))
+            self.cmb_silo.setEnabled(True)
+        elif dtype == "farmers":
+            self.cmb_farmer.clear()
+            self.cmb_farmer.addItem("-- اختر الفلاح --", "")
+            for item in data:
+                self.cmb_farmer.addItem(item.get('text',''), str(item.get('id','')))
+            self.cmb_farmer.setEnabled(bool(data))
+            self.log_viewer.append(f"{'✅' if data else '⚠️'} {len(data)} نتيجة")
+
+    def _on_error(self, msg):
+        self.progress.setVisible(False)
+        self.log_viewer.append(f"❌ {msg}")
+
+    def _save_transaction(self):
+        farmer_text = self.cmb_farmer.currentText()
+        silo_id = self.cmb_silo.currentData()
+        center_id = self.cmb_center.currentData()
+        is_outer = "true" if self.chk_outer.isChecked() else "false"
+        if not farmer_text or farmer_text.startswith("--"):
+            farmer_text = self.input_farmer.text().strip()
+        if not farmer_text:
+            QMessageBox.warning(self, "!", "اختر فلاحاً أو اكتب اسمه"); return
+        if not silo_id or not center_id:
+            QMessageBox.warning(self, "!", "اختر الشعبة والسايلو"); return
+        with sqlite3.connect(self.db_name) as conn:
+            conn.cursor().execute(
+                "INSERT INTO transactions (client_name,silo_id,center_id,is_outer) VALUES(?,?,?,?)",
+                (farmer_text, silo_id, center_id, is_outer))
+            conn.commit()
+        QMessageBox.information(self, "✅", f"تم إضافة ({farmer_text})")
+        self.input_farmer.clear()
+        self._refresh_table()
+
+    def _refresh_table(self):
+        with sqlite3.connect(self.db_name) as conn:
+            rows = conn.cursor().execute(
+                "SELECT id,client_name,silo_id,center_id,is_outer,status FROM transactions ORDER BY id DESC").fetchall()
+        self.table.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            for c, val in enumerate(row):
+                item = QTableWidgetItem(str(val))
+                item.setFlags(item.flags() ^ Qt.ItemFlag.ItemIsEditable)
+                self.table.setItem(r, c, item)
+
+    def _delete_selected(self):
+        row = self.table.currentRow()
+        if row < 0: return
+        tx_id = self.table.item(row, 0).text()
+        if QMessageBox.question(self, "؟", f"حذف {tx_id}؟") == QMessageBox.StandardButton.Yes:
+            with sqlite3.connect(self.db_name) as conn:
+                conn.cursor().execute("DELETE FROM transactions WHERE id=?", (tx_id,))
+                conn.commit()
+            self._refresh_table()
+
+    # أحداث الأزرار
+    def _run_login(self):
+        self.btn_session.setEnabled(False)
+        self.browser_thread = BrowserWorker("login")
+        self.browser_thread.log_signal.connect(self.log_viewer.append)
+        self.browser_thread.finished_signal.connect(self._on_browser_done)
         self.browser_thread.start()
 
-    def _browser_done(self, ok):
-        self.btn_login.setEnabled(True); self.btn_token.setEnabled(True); self.btn_close.setEnabled(True)
+    def _run_token_extract(self):
+        self.btn_token.setEnabled(False)
+        self.browser_thread = BrowserWorker("token")
+        self.browser_thread.log_signal.connect(self.log_viewer.append)
+        self.browser_thread.finished_signal.connect(self._on_browser_done)
+        self.browser_thread.start()
+
+    def _on_browser_done(self, success):
+        self.btn_session.setEnabled(True)
+        self.btn_token.setEnabled(True)
+        self.btn_close_browser.setEnabled(True)
+        if success:
+            self.log_viewer.append("✅ جاهز! اضغط 'إغلاق المتصفح' عند الانتهاء.")
 
     def _close_browser(self):
+        """إغلاق المتصفح يدوياً"""
         if self.browser_thread and self.browser_thread.driver:
-            try: self.browser_thread.driver.quit(); self.log.append("✅ المتصفح أُغلق.")
-            except Exception as e: self.log.append(f"⚠️ {e}")
-            self.browser_thread.driver = None
-        self.btn_close.setEnabled(False)
+            try:
+                self.browser_thread.driver.quit()
+                self.browser_thread.driver = None
+                self.log_viewer.append("✅ تم إغلاق المتصفح.")
+            except Exception as e:
+                self.log_viewer.append(f"⚠️ خطأ أثناء الإغلاق: {e}")
+        else:
+            self.log_viewer.append("ℹ️ لا يوجد متصفح مفتوح.")
+        self.btn_close_browser.setEnabled(False)
 
-    def _start(self):
-        self.monitor_thread = MonitoringWorker(self.db, self.spin_min.value(), self.spin_max.value())
-        self.monitor_thread.log.connect(self.log.append)
-        self.monitor_thread.start()
+    def _start_engine(self):
+        self.monitoring_thread = MonitoringWorker(self.db_name)
+        self.monitoring_thread.log_signal.connect(self.log_viewer.append)
+        self.monitoring_thread.start()
         self.btn_start.setEnabled(False); self.btn_stop.setEnabled(True)
 
-    def _stop(self):
-        if self.monitor_thread: self.monitor_thread.stop()
-        self.log.append("🛑 إيقاف."); self.btn_start.setEnabled(True); self.btn_stop.setEnabled(False)
+    def _stop_engine(self):
+        if self.monitoring_thread:
+            self.monitoring_thread.stop()
+            self.log_viewer.append("🛑 إيقاف.")
+            self.btn_start.setEnabled(True); self.btn_stop.setEnabled(False)
 
-    def _local_govs(self):
-        self.cmb_gov.clear(); self.cmb_gov.addItem("--", "")
-        for g in GOVERNORATES: self.cmb_gov.addItem(g['name'], g['id'])
-
-    def _server_govs(self):
-        acct = self.cmb_acct2.currentText()
-        w = DataFetchWorker("governorates", account=acct)
-        w.result.connect(self._data); w.error.connect(lambda m: self.log.append(f"❌ {m}"))
-        self.fetch_threads.append(w); w.start()
-
-    def _gov_ch(self, i):
-        gid = self.cmb_gov.currentData()
-        self.cmb_dir.clear(); self.cmb_dir.addItem("--",""); self.cmb_dir.setEnabled(False)
-        self.cmb_ctr.clear(); self.cmb_ctr.addItem("--",""); self.cmb_ctr.setEnabled(False)
-        self.cmb_silo.clear(); self.cmb_silo.addItem("--",""); self.cmb_silo.setEnabled(False)
-        if gid:
-            w = DataFetchWorker("directorates",{"gid":gid},self.cmb_acct2.currentText())
-            w.result.connect(self._data); w.error.connect(lambda m: self.log.append(f"❌ {m}"))
-            self.fetch_threads.append(w); w.start()
-
-    def _dir_ch(self, i):
-        did = self.cmb_dir.currentData()
-        self.cmb_ctr.clear(); self.cmb_ctr.addItem("--",""); self.cmb_ctr.setEnabled(False)
-        self.cmb_silo.clear(); self.cmb_silo.addItem("--",""); self.cmb_silo.setEnabled(False)
-        if did:
-            w = DataFetchWorker("centers",{"did":did},self.cmb_acct2.currentText())
-            w.result.connect(self._data); w.error.connect(lambda m: self.log.append(f"❌ {m}"))
-            self.fetch_threads.append(w); w.start()
-
-    def _ctr_ch(self, i):
-        cid = self.cmb_ctr.currentData()
-        self.cmb_silo.clear(); self.cmb_silo.addItem("--",""); self.cmb_silo.setEnabled(False)
-        if cid:
-            w = DataFetchWorker("silos",{"cid":cid},self.cmb_acct2.currentText())
-            w.result.connect(self._data); w.error.connect(lambda m: self.log.append(f"❌ {m}"))
-            self.fetch_threads.append(w); w.start()
-
-    def _search_f(self):
-        q = self.inp_f.text().strip(); cid = self.cmb_ctr.currentData(); sid = self.cmb_silo.currentData()
-        if not q or not cid or not sid: QMessageBox.warning(self,"!","أكمل البيانات"); return
-        outer = "true" if self.chk_outer.isChecked() else "false"
-        w = DataFetchWorker("farmers",{"cid":cid,"sid":sid,"outer":outer,"q":q},self.cmb_acct2.currentText())
-        w.result.connect(self._data); w.error.connect(lambda m: self.log.append(f"❌ {m}"))
-        self.fetch_threads.append(w); w.start()
-
-    def _data(self, t, d):
-        if t=="governorates":
-            self.cmb_gov.clear(); self.cmb_gov.addItem("--","")
-            for x in d: self.cmb_gov.addItem(x['name'], x['id'])
-        elif t=="directorates":
-            self.cmb_dir.clear(); self.cmb_dir.addItem("--","")
-            for x in d: self.cmb_dir.addItem(x.get('name',''), str(x.get('id','')))
-            self.cmb_dir.setEnabled(True)
-        elif t=="centers":
-            self.cmb_ctr.clear(); self.cmb_ctr.addItem("--","")
-            for x in d: self.cmb_ctr.addItem(x.get('name',''), str(x.get('id','')))
-            self.cmb_ctr.setEnabled(True)
-        elif t=="silos":
-            self.cmb_silo.clear(); self.cmb_silo.addItem("--","")
-            for x in d: self.cmb_silo.addItem(x.get('name',''), str(x.get('id','')))
-            self.cmb_silo.setEnabled(True)
-        elif t=="farmers":
-            self.cmb_f.clear(); self.cmb_f.addItem("--","")
-            for x in d: self.cmb_f.addItem(x.get('text',''), str(x.get('id','')))
-            self.cmb_f.setEnabled(bool(d))
-            self.log.append(f"{'✅' if d else '⚠️'} {len(d)} نتيجة")
-
-    def _save(self):
-        fn = self.cmb_f.currentText() if self.cmb_f.currentData() else self.inp_f.text().strip()
-        sid = self.cmb_silo.currentData(); cid = self.cmb_ctr.currentData()
-        acct = self.cmb_acct2.currentText()
-        outer = "true" if self.chk_outer.isChecked() else "false"
-        if not fn or fn=="--": QMessageBox.warning(self,"!","اختر/اكتب فلاح"); return
-        if not sid or not cid: QMessageBox.warning(self,"!","اختر الشعبة والسايلو"); return
-        if not acct or acct=="(لا حسابات)": QMessageBox.warning(self,"!","اختر حساب"); return
-        with sqlite3.connect(self.db) as c:
-            c.execute("INSERT INTO transactions(client_name,silo_id,center_id,is_outer,account) VALUES(?,?,?,?,?)",
-                      (fn,sid,cid,outer,acct))
-        QMessageBox.information(self,"✅",f"تم حفظ ({fn}) بحساب [{acct}]")
-        self._rtbl()
-
-    def _direct_send(self):
-        """إرسال مباشر فوري"""
-        fn = self.cmb_f.currentText() if self.cmb_f.currentData() else self.inp_f.text().strip()
-        sid = self.cmb_silo.currentData(); cid = self.cmb_ctr.currentData()
-        acct = self.cmb_acct2.currentText()
-        outer = "true" if self.chk_outer.isChecked() else "false"
-        if not fn or fn=="--": QMessageBox.warning(self,"!","اختر/اكتب فلاح"); return
-        if not sid or not cid: QMessageBox.warning(self,"!","اختر الشعبة والسايلو"); return
-        if not acct or acct=="(لا حسابات)": QMessageBox.warning(self,"!","اختر حساب"); return
-        self.btn_direct.setEnabled(False)
-        w = DirectBookingWorker(acct, fn, sid, cid, outer)
-        w.log.connect(self.log.append)
-        w.done.connect(lambda ok, d: self.btn_direct.setEnabled(True))
-        self.fetch_threads.append(w); w.start()
-
-    def _rtbl(self):
-        with sqlite3.connect(self.db) as c:
-            rows = c.execute("SELECT id,client_name,silo_id,center_id,is_outer,account,status FROM transactions ORDER BY id DESC").fetchall()
-        self.tbl.setRowCount(len(rows))
-        for r, row in enumerate(rows):
-            for c, v in enumerate(row):
-                self.tbl.setItem(r, c, QTableWidgetItem(str(v or "")))
-
-    def _del(self):
-        r = self.tbl.currentRow()
-        if r < 0: return
-        tid = self.tbl.item(r, 0).text()
-        if QMessageBox.question(self,"؟",f"حذف #{tid}?") == QMessageBox.StandardButton.Yes:
-            with sqlite3.connect(self.db) as c: c.execute("DELETE FROM transactions WHERE id=?",(tid,))
-            self._rtbl()
 
 if __name__ == '__main__':
-    app = QApplication(sys.argv); app.setStyle("Fusion")
-    w = App(); w.show(); sys.exit(app.exec())
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    gui = AlGhanemBotGUI()
+    gui.show()
+    sys.exit(app.exec())
