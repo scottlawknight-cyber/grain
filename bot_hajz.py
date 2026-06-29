@@ -111,6 +111,7 @@ class BrowserWorker(QThread):
         """mode: 'login' لتسجيل الدخول, 'token' لسحب التوكن"""
         super().__init__()
         self.mode = mode
+        self.driver = None  # مرجع المتصفح للإغلاق اليدوي
 
     def run(self):
         options = uc.ChromeOptions()
@@ -214,15 +215,15 @@ class BrowserWorker(QThread):
                 json.dump(unique, f, ensure_ascii=False, indent=2)
 
             self.log_signal.emit(f"✅ تم استخراج الكوكيز بنجاح! العدد: {len(unique)}")
+            self.log_signal.emit("💡 المتصفح مفتوح - اضغط 'إغلاق المتصفح' عند الانتهاء.")
+            # لا يُغلق المتصفح تلقائياً - ينتظر الزر
+            self.driver = driver
             self.finished_signal.emit(True)
         else:
             self.log_signal.emit("⚠️ انتهت المهلة. حاول مرة أخرى.")
+            self.driver = driver  # يبقى مفتوحاً للمحاولة مرة أخرى
             self.finished_signal.emit(False)
-
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        # لا إغلاق تلقائي!
 
     def _extract_token(self, driver):
         """سحب التوكن من المتصفح عبر فتح صفحة الحجز"""
@@ -264,15 +265,14 @@ class BrowserWorker(QThread):
                 f.write(token)
             self.log_signal.emit(f"✅ تم سحب التوكن بنجاح! (محفوظ في token.txt)")
             self.log_signal.emit(f"🔑 التوكن: {token[:50]}...")
+            self.log_signal.emit("💡 المتصفح مفتوح - اضغط 'إغلاق المتصفح' عند الانتهاء.")
+            self.driver = driver
             self.finished_signal.emit(True)
         else:
             self.log_signal.emit("❌ فشل سحب التوكن - تأكد من صلاحية الجلسة")
+            self.driver = driver
             self.finished_signal.emit(False)
-
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        # لا إغلاق تلقائي!
 
 
 
@@ -399,24 +399,15 @@ class MonitoringWorker(QThread):
         return None, None
 
     def get_token(self):
-        """سحب التوكن من الملف المحفوظ (المستخرج بالمتصفح)"""
+        """سحب التوكن حصراً من الملف المحفوظ (المستخرج يدوياً بالمتصفح)"""
         try:
             with open('token.txt', 'r', encoding='utf-8') as f:
                 token = f.read().strip()
-                if token:
+                if token and len(token) > 20:
                     return token
         except FileNotFoundError:
             pass
-        # fallback: سحب من requests
-        try:
-            res = self.session.get(BOOKING_PAGE_URL, timeout=15)
-            if res.status_code == 200:
-                soup = BeautifulSoup(res.text, 'html.parser')
-                inp = soup.find('input', {'name': '__RequestVerificationToken'})
-                if inp:
-                    return inp['value']
-        except Exception:
-            pass
+        # لا يوجد fallback - التوكن يُسحب فقط عبر الزر
         return None
 
     def submit_booking(self, token, farmer_id, silo_id, is_outer):
@@ -605,8 +596,14 @@ class AlGhanemBotGUI(QMainWindow):
         self.btn_token.setStyleSheet("background:#6f42c1;color:white;font-weight:bold;padding:12px;border-radius:5px;")
         self.btn_token.clicked.connect(self._run_token_extract)
 
+        self.btn_close_browser = QPushButton("❌ إغلاق المتصفح")
+        self.btn_close_browser.setStyleSheet("background:#dc3545;color:white;font-weight:bold;padding:12px;border-radius:5px;")
+        self.btn_close_browser.clicked.connect(self._close_browser)
+        self.btn_close_browser.setEnabled(False)
+
         row1.addWidget(self.btn_session)
         row1.addWidget(self.btn_token)
+        row1.addWidget(self.btn_close_browser)
         layout.addLayout(row1)
 
         # صف 2: تشغيل/إيقاف المحرك
@@ -899,15 +896,35 @@ class AlGhanemBotGUI(QMainWindow):
         self.btn_session.setEnabled(False)
         self.browser_thread = BrowserWorker("login")
         self.browser_thread.log_signal.connect(self.log_viewer.append)
-        self.browser_thread.finished_signal.connect(lambda s: self.btn_session.setEnabled(True))
+        self.browser_thread.finished_signal.connect(self._on_browser_done)
         self.browser_thread.start()
 
     def _run_token_extract(self):
         self.btn_token.setEnabled(False)
         self.browser_thread = BrowserWorker("token")
         self.browser_thread.log_signal.connect(self.log_viewer.append)
-        self.browser_thread.finished_signal.connect(lambda s: self.btn_token.setEnabled(True))
+        self.browser_thread.finished_signal.connect(self._on_browser_done)
         self.browser_thread.start()
+
+    def _on_browser_done(self, success):
+        self.btn_session.setEnabled(True)
+        self.btn_token.setEnabled(True)
+        self.btn_close_browser.setEnabled(True)
+        if success:
+            self.log_viewer.append("✅ جاهز! اضغط 'إغلاق المتصفح' عند الانتهاء.")
+
+    def _close_browser(self):
+        """إغلاق المتصفح يدوياً"""
+        if self.browser_thread and self.browser_thread.driver:
+            try:
+                self.browser_thread.driver.quit()
+                self.browser_thread.driver = None
+                self.log_viewer.append("✅ تم إغلاق المتصفح.")
+            except Exception as e:
+                self.log_viewer.append(f"⚠️ خطأ أثناء الإغلاق: {e}")
+        else:
+            self.log_viewer.append("ℹ️ لا يوجد متصفح مفتوح.")
+        self.btn_close_browser.setEnabled(False)
 
     def _start_engine(self):
         self.monitoring_thread = MonitoringWorker(self.db_name)
