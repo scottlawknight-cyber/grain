@@ -1,0 +1,18 @@
+[
+  {
+    "client_name": "اسم الفلاح الأول",
+    "silo_id": "123",
+    "center_id": "456",
+    "is_outer": "false",
+    "account_name": "حساب1",
+    "status": "pending"
+  },
+  {
+    "client_name": "اسم الفلاح الثاني",
+    "silo_id": "123",
+    "center_id": "456",
+    "is_outer": "false",
+    "account_name": "حساب1",
+    "status": "pending"
+  }
+]
